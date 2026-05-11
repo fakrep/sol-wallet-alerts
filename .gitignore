@@ -1,0 +1,21 @@
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Python virtualenv/cache
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Runtime logs
+logs/*.log*
+
+# Runtime wallet data/history/state
+# Keep data/.gitkeep tracked so the directory exists in fresh clones.
+data/*.json
+data/*.jsonl
+data/*.tmp
+data/*.broken-*.json
+data/state.backup-*.json
