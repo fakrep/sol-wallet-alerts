@@ -12,6 +12,7 @@ Designed for cron in a small LXC:
 from __future__ import annotations
 
 import argparse
+import base64
 import html
 import json
 import logging
@@ -37,6 +38,8 @@ LOG_PATH = LOG_DIR / "blockzocker_wallet_alerts.log"
 DEFAULT_LABEL = "BlockZocker Trading Wallet"
 HELIUS_LIMIT = 25
 JUPITER_PERPS_PROGRAM = "PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu"
+ANCHOR_IX_INSTANT_INCREASE_POSITION = bytes.fromhex("a47e44b6dfa640b7")
+ANCHOR_IX_INSTANT_DECREASE_POSITION = bytes.fromhex("2e17f02c1e8a5e8c")
 RELEVANT_TYPES = {
     "SWAP",
     "TOKEN_TRANSFER",
@@ -254,6 +257,16 @@ def base58_decode(value: str) -> bytes:
     return (b"\0" * padding) + decoded
 
 
+def base58_encode(value: bytes) -> str:
+    n = int.from_bytes(value, "big")
+    encoded = ""
+    while n:
+        n, rem = divmod(n, 58)
+        encoded = BASE58_ALPHABET[rem] + encoded
+    padding = len(value) - len(value.lstrip(b"\0"))
+    return ("1" * padding) + (encoded or "")
+
+
 def parse_log_scaled_usd(logs: list[str], label: str) -> float | None:
     pattern = re.compile(rf"{re.escape(label)}:\s*(\d+)")
     for line in logs:
@@ -286,10 +299,10 @@ def raw_account_keys(raw_tx: dict[str, Any]) -> list[str]:
     return keys
 
 
-def parse_perp_size_delta_usd(raw_tx: dict[str, Any]) -> float | None:
+def jupiter_perps_instruction_data(raw_tx: dict[str, Any]) -> list[bytes]:
     keys = raw_account_keys(raw_tx)
     instructions = (((raw_tx.get("transaction") or {}).get("message") or {}).get("instructions") or [])
-    candidates: list[float] = []
+    decoded_instructions: list[bytes] = []
     for instruction in instructions:
         try:
             program_id = keys[int(instruction.get("programIdIndex"))]
@@ -301,9 +314,15 @@ def parse_perp_size_delta_usd(raw_tx: dict[str, Any]) -> float | None:
         if not isinstance(data, str):
             continue
         try:
-            decoded = base58_decode(data)
+            decoded_instructions.append(base58_decode(data))
         except (ValueError, IndexError):
             continue
+    return decoded_instructions
+
+
+def parse_perp_size_delta_usd(raw_tx: dict[str, Any]) -> float | None:
+    candidates: list[float] = []
+    for decoded in jupiter_perps_instruction_data(raw_tx):
         if len(decoded) < 16:
             continue
         # Anchor instruction data starts with an 8-byte discriminator. For the
@@ -314,6 +333,132 @@ def parse_perp_size_delta_usd(raw_tx: dict[str, Any]) -> float | None:
         if 1 <= size_delta <= 10_000_000:
             candidates.append(size_delta)
     return max(candidates) if candidates else None
+
+
+def parse_borsh_option_u64(data: bytes, offset: int) -> int | None:
+    """Return the offset after a Borsh Option<u64>, or None if malformed."""
+    if offset >= len(data):
+        return None
+    tag = data[offset]
+    offset += 1
+    if tag == 0:
+        return offset
+    if tag == 1 and offset + 8 <= len(data):
+        return offset + 8
+    return None
+
+
+def side_name(value: int) -> str | None:
+    # Jupiter Perps Side enum in the public Anchor IDL: None=0, Long=1, Short=2.
+    return {1: "Long", 2: "Short"}.get(value)
+
+
+def rpc_request(cfg: dict[str, str], method: str, params: list[Any]) -> Any:
+    url = f"https://{cfg['helius_network']}.helius-rpc.com/?api-key={cfg['helius_api_key']}"
+    payload = {
+        "jsonrpc": "2.0",
+        "id": "blockzocker-wallet-alerts",
+        "method": method,
+        "params": params,
+    }
+    resp = request_with_retry("POST", url, json=payload, timeout=30)
+    if not resp.ok:
+        raise RuntimeError(f"RPC {method} failed: HTTP {resp.status_code}: {resp.text[:500]}")
+    body = resp.json()
+    if body.get("error"):
+        raise RuntimeError(f"RPC {method} failed: {body['error']}")
+    return body.get("result")
+
+
+def fetch_account_data(cfg: dict[str, str], account: str) -> bytes | None:
+    try:
+        value = (rpc_request(cfg, "getAccountInfo", [account, {"encoding": "base64"}]) or {}).get("value") or {}
+        encoded = (value.get("data") or [None])[0]
+        return base64.b64decode(encoded) if isinstance(encoded, str) else None
+    except Exception as exc:
+        logging.warning("Account lookup failed for %s: %s", account, exc)
+        return None
+
+
+def parse_position_account_side(cfg: dict[str, str], account: str) -> str | None:
+    data = fetch_account_data(cfg, account)
+    # Position layout from the Jupiter Perps Anchor IDL:
+    # discriminator(8) + owner/pool/custody/collateralCustody(4*32)
+    # + openTime/updateTime(2*8) + Side enum(u8).
+    if data and len(data) > 152:
+        return side_name(data[152])
+    return None
+
+
+def position_accounts_from_perp_ix(raw_tx: dict[str, Any]) -> list[str]:
+    keys = raw_account_keys(raw_tx)
+    instructions = (((raw_tx.get("transaction") or {}).get("message") or {}).get("instructions") or [])
+    positions: list[str] = []
+    for instruction in instructions:
+        try:
+            program_id = keys[int(instruction.get("programIdIndex"))]
+        except (TypeError, ValueError, IndexError):
+            continue
+        if program_id != JUPITER_PERPS_PROGRAM:
+            continue
+        accounts = instruction.get("accounts") or []
+        data = instruction.get("data")
+        if not isinstance(data, str):
+            continue
+        try:
+            decoded = base58_decode(data)
+        except (ValueError, IndexError):
+            continue
+        position_index = None
+        if decoded.startswith(ANCHOR_IX_INSTANT_INCREASE_POSITION):
+            position_index = 6
+        elif decoded.startswith(ANCHOR_IX_INSTANT_DECREASE_POSITION):
+            position_index = 7
+        if position_index is None or position_index >= len(accounts):
+            continue
+        try:
+            key_index = int(accounts[position_index])
+            positions.append(keys[key_index])
+        except (TypeError, ValueError, IndexError):
+            continue
+    return positions
+
+
+def parse_perp_side(cfg: dict[str, str], raw_tx: dict[str, Any]) -> str | None:
+    for decoded in jupiter_perps_instruction_data(raw_tx):
+        if not decoded.startswith(ANCHOR_IX_INSTANT_INCREASE_POSITION):
+            continue
+        # Current instant-increase payload observed on-chain:
+        # u64 sizeUsdDelta, Option<u64> collateralTokenDelta, Side side,
+        # u64 priceSlippage, i64 requestTime. Older IDLs include extra optional
+        # swap fields, so also try that longer layout below.
+        payload = decoded[8:]
+        if len(payload) < 10:
+            continue
+        offset = 8
+        compact_offset = parse_borsh_option_u64(payload, offset)
+        if compact_offset is not None and compact_offset < len(payload):
+            side = side_name(payload[compact_offset])
+            if side:
+                return side
+
+        offset = 8
+        for _ in range(3):
+            next_offset = parse_borsh_option_u64(payload, offset)
+            if next_offset is None:
+                break
+            offset = next_offset
+        else:
+            if offset < len(payload):
+                side = side_name(payload[offset])
+                if side:
+                    return side
+
+    for account in position_accounts_from_perp_ix(raw_tx):
+        side = parse_position_account_side(cfg, account)
+        if side:
+            return side
+    return None
 
 
 def extract_perp_details(cfg: dict[str, str], signature: str) -> list[str]:
@@ -331,6 +476,10 @@ def extract_perp_details(cfg: dict[str, str], signature: str) -> list[str]:
     fee_usd = parse_log_scaled_usd(logs, "Collected fee")
 
     lines: list[str] = []
+    side = parse_perp_side(cfg, raw_tx)
+
+    if side:
+        lines.append(f"Side: {side}")
     if size_delta_usd and collateral_added_usd and collateral_added_usd > 0:
         leverage = size_delta_usd / collateral_added_usd
         lines.append(f"Leverage: ≈{leverage:.1f}x")
@@ -577,6 +726,7 @@ def build_message(tx: dict[str, Any], cfg: dict[str, str]) -> str:
     transfer_text = "\n".join(f"• {html.escape(x)}" for x in transfers) if transfers else "• No clear transfer summary"
 
     if perp_details:
+        side = detail_value(perp_details, "Side")
         leverage = detail_value(perp_details, "Leverage")
         size_delta = detail_value(perp_details, "Position size Δ")
         collateral = detail_value(perp_details, "Collateral added")
@@ -588,7 +738,13 @@ def build_message(tx: dict[str, Any], cfg: dict[str, str]) -> str:
         lines = [
             f"🚨 <b>{html.escape(cfg['wallet_label'])} · Jupiter Perps</b>",
         ]
-        if leverage:
+        if side and leverage:
+            emoji = "🟢" if side == "Long" else "🔴" if side == "Short" else "⚪️"
+            lines.append(f"<b>{emoji} {html.escape(side.upper())} · {html.escape(leverage)} leverage</b>")
+        elif side:
+            emoji = "🟢" if side == "Long" else "🔴" if side == "Short" else "⚪️"
+            lines.append(f"<b>{emoji} {html.escape(side.upper())}</b>")
+        elif leverage:
             lines.append(f"<b>{html.escape(leverage)} leverage</b>")
         if action:
             lines.append(f"💸 {html.escape(action)}")
@@ -662,6 +818,135 @@ def build_message(tx: dict[str, Any], cfg: dict[str, str]) -> str:
         f"<b>Time:</b> {when}\n"
         f"<a href=\"{html.escape(link)}\">Open in Solscan</a>"
     )
+
+
+def mint_symbol(mint: str) -> str:
+    return KNOWN_MINT_SYMBOLS.get(mint) or mint[:6] + "…"
+
+
+def parse_custody_mint(cfg: dict[str, str], custody: str) -> str | None:
+    data = fetch_account_data(cfg, custody)
+    # Custody account layout from Jupiter Perps Anchor IDL:
+    # discriminator(8) + pool(32) + mint(32) + ...
+    if data and len(data) >= 72:
+        return base58_encode(data[40:72])
+    return None
+
+
+def position_snapshot(cfg: dict[str, str], account: str, data: bytes) -> dict[str, Any] | None:
+    if len(data) < 209:
+        return None
+    custody = base58_encode(data[72:104])
+    collateral_custody = base58_encode(data[104:136])
+    side = side_name(data[152]) or f"Unknown({data[152]})"
+    price = int.from_bytes(data[153:161], "little") / 1_000_000
+    size_usd = int.from_bytes(data[161:169], "little") / 1_000_000
+    collateral_usd = int.from_bytes(data[169:177], "little") / 1_000_000
+    realised_pnl_usd = int.from_bytes(data[177:185], "little", signed=True) / 1_000_000
+    open_time = int.from_bytes(data[136:144], "little", signed=True)
+    update_time = int.from_bytes(data[144:152], "little", signed=True)
+    mint = parse_custody_mint(cfg, custody)
+    collateral_mint = parse_custody_mint(cfg, collateral_custody)
+    return {
+        "account": account,
+        "side": side,
+        "mint": mint,
+        "symbol": mint_symbol(mint) if mint else "unknown",
+        "collateral_mint": collateral_mint,
+        "collateral_symbol": mint_symbol(collateral_mint) if collateral_mint else "unknown",
+        "size_usd": size_usd,
+        "collateral_usd": collateral_usd,
+        "leverage": size_usd / collateral_usd if collateral_usd else None,
+        "price": price,
+        "realised_pnl_usd": realised_pnl_usd,
+        "open_time": open_time,
+        "update_time": update_time,
+    }
+
+
+def fetch_open_positions(cfg: dict[str, str]) -> list[dict[str, Any]]:
+    result = rpc_request(cfg, "getProgramAccounts", [
+        JUPITER_PERPS_PROGRAM,
+        {
+            "encoding": "base64",
+            "filters": [
+                {"dataSize": 216},
+                {"memcmp": {"offset": 8, "bytes": cfg["wallet"]}},
+            ],
+        },
+    ])
+    positions: list[dict[str, Any]] = []
+    for item in result or []:
+        encoded = (((item.get("account") or {}).get("data") or [None])[0])
+        if not isinstance(encoded, str):
+            continue
+        pos = position_snapshot(cfg, str(item.get("pubkey") or "unknown"), base64.b64decode(encoded))
+        if pos and pos["size_usd"] > 0:
+            positions.append(pos)
+    return positions
+
+
+def fetch_wallet_token_balances(cfg: dict[str, str]) -> list[dict[str, str]]:
+    result = rpc_request(cfg, "getTokenAccountsByOwner", [
+        cfg["wallet"],
+        {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+        {"encoding": "jsonParsed"},
+    ])
+    balances: list[dict[str, str]] = []
+    for item in (result or {}).get("value") or []:
+        info = (((item.get("account") or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
+        token_amount = info.get("tokenAmount") or {}
+        try:
+            amount = float(token_amount.get("uiAmount") or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        if amount == 0:
+            continue
+        mint = str(info.get("mint") or "unknown")
+        balances.append({
+            "symbol": mint_symbol(mint),
+            "amount": str(token_amount.get("uiAmountString") or amount),
+            "mint": mint,
+        })
+    return balances
+
+
+def build_snapshot_message(cfg: dict[str, str]) -> str:
+    sol_lamports = int((rpc_request(cfg, "getBalance", [cfg["wallet"]]) or {}).get("value") or 0)
+    token_balances = fetch_wallet_token_balances(cfg)
+    positions = fetch_open_positions(cfg)
+    when = html.escape(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+    wallet_short = cfg["wallet"][:4] + "…" + cfg["wallet"][-4:]
+
+    lines = [
+        f"📊 <b>{html.escape(cfg['wallet_label'])} · Current Snapshot</b>",
+        f"👛 Wallet: <code>{html.escape(wallet_short)}</code>",
+        f"🕒 {when}",
+        "",
+        "<b>Balances</b>",
+        f"• SOL: {fmt_amount(sol_lamports / 1_000_000_000)}",
+    ]
+    for bal in token_balances:
+        lines.append(f"• {html.escape(bal['symbol'])}: {html.escape(bal['amount'])}")
+
+    lines.extend(["", "<b>Open Jupiter Perps positions</b>"])
+    if not positions:
+        lines.append("• None")
+    for pos in positions:
+        side = str(pos["side"])
+        emoji = "🟢" if side == "Long" else "🔴" if side == "Short" else "⚪️"
+        leverage = pos.get("leverage")
+        lev_text = f" · {leverage:.2f}x" if isinstance(leverage, float) else ""
+        lines.append(f"• <b>{emoji} {html.escape(side.upper())} {html.escape(str(pos['symbol']))}{lev_text}</b>")
+        lines.append(f"  Size {html.escape(fmt_usd(pos['size_usd']) or '?')} · Collateral {html.escape(fmt_usd(pos['collateral_usd']) or '?')} {html.escape(str(pos['collateral_symbol']))}")
+        lines.append(f"  Price {html.escape(fmt_usd(pos['price']) or '?')} · Realised PnL {html.escape(fmt_usd(pos['realised_pnl_usd']) or '?')}")
+        lines.append(f"  <a href=\"https://solscan.io/account/{html.escape(str(pos['account']))}\">Position account</a>")
+
+    return "\n".join(lines)
+
+
+def send_snapshot(cfg: dict[str, str], *, dry_run: bool = False) -> None:
+    send_telegram(cfg, build_snapshot_message(cfg), dry_run=dry_run)
 
 
 def send_telegram(cfg: dict[str, str], message: str, dry_run: bool = False) -> None:
@@ -755,6 +1040,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Print alerts instead of sending/updating state")
     parser.add_argument("--bootstrap", action="store_true", help="Mark recent txs processed without sending alerts")
     parser.add_argument("--once", action="store_true", help="Run one check and exit (default; cron-friendly)")
+    parser.add_argument("--snapshot", action="store_true", help="Send current wallet balances and open Jupiter Perps positions")
     return parser.parse_args(argv)
 
 
@@ -763,6 +1049,10 @@ def main(argv: list[str]) -> int:
     setup_logging()
     try:
         cfg = load_config()
+        if args.snapshot:
+            send_snapshot(cfg, dry_run=args.dry_run)
+            logging.info("Snapshot sent")
+            return 0
         sent = process_transactions(cfg, dry_run=args.dry_run, bootstrap=args.bootstrap)
         logging.info("Done; sent %d alert(s)", sent)
         return 0
