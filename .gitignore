@@ -17,5 +17,6 @@ logs/*.log*
 data/*.json
 data/*.jsonl
 data/*.tmp
+data/*.lock
 data/*.broken-*.json
 data/state.backup-*.json
